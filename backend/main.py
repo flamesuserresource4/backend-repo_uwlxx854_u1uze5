@@ -1,13 +1,20 @@
 import os
 from datetime import datetime, date
-from typing import List, Optional, Literal
+from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
+from bson import ObjectId
 
 from database import create_document, get_documents, db
-from schemas import User as UserSchema, Subject as SubjectSchema, Enrollment as EnrollmentSchema, Attendance as AttendanceSchema, Bill as BillSchema, Payment as PaymentSchema
+from schemas import (
+    User as UserSchema,
+    Subject as SubjectSchema,
+    Enrollment as EnrollmentSchema,
+    Attendance as AttendanceSchema,
+    Bill as BillSchema,
+)
 
 app = FastAPI(title="Enrollment System API")
 
@@ -43,12 +50,28 @@ def login(payload: LoginRequest):
     return {"user": {k: v for k, v in user.items() if k != "password"}}
 
 
+# ---------- Users (Admin) ----------
+class UserCreate(BaseModel):
+    name: str
+    email: EmailStr
+    role: str
+    password: str
+
+
+@app.post("/users")
+def create_user(payload: UserCreate):
+    if db["user"].find_one({"email": payload.email}):
+        raise HTTPException(status_code=400, detail="Email already in use")
+    uid = create_document("user", payload.model_dump() | {"is_active": True})
+    return {"id": uid}
+
+
 @app.get("/users")
 def list_users(role: Optional[str] = None):
     filt = {"role": role} if role else {}
     docs = get_documents("user", filt)
     for d in docs:
-        d["_id"] = str(d["_id"]) 
+        d["_id"] = str(d["_id"])
         if "password" in d:
             del d["password"]
     return {"items": docs}
@@ -66,8 +89,20 @@ def list_subjects(faculty_id: Optional[str] = None):
     filt = {"faculty_id": faculty_id} if faculty_id else {}
     docs = get_documents("subject", filt)
     for d in docs:
-        d["_id"] = str(d["_id"]) 
+        d["_id"] = str(d["_id"])  
     return {"items": docs}
+
+
+@app.get("/subjects/{subject_id}")
+def get_subject(subject_id: str):
+    try:
+        doc = db["subject"].find_one({"_id": ObjectId(subject_id)})
+        if not doc:
+            raise HTTPException(status_code=404, detail="Subject not found")
+        doc["_id"] = str(doc["_id"]) 
+        return doc
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid subject id")
 
 
 # ---------- Enrollments ----------
@@ -81,39 +116,34 @@ def create_enrollment(enr: EnrollmentSchema):
     }))
     if existing:
         raise HTTPException(status_code=400, detail="Already enrolled")
+
     eid = create_document("enrollment", enr)
-    # Upsert a bill line for the subject
-    subj = db["subject"].find_one({"_id": db.client.get_default_database()["subject"].find_one({"code": {"$exists": True}})})
-    # Get subject for billing
-    subject = db["subject"].find_one({"_id": db["subject"].find_one({"_id": {"$exists": True}})["_id"]}) if False else db["subject"].find_one({"_id": db["subject"].find_one})
-    subject = db["subject"].find_one({"_id": db["subject"].find_one})
-    # The above is not reliable without ObjectId parsing; fetch by id string
-    from bson import ObjectId
+
+    # Billing: compute subject fee if available and upsert into student's bill
+    fee = 0.0
     try:
         subject = db["subject"].find_one({"_id": ObjectId(enr.subject_id)})
+        if subject:
+            units = float(subject.get("units", 0))
+            fee_per_unit = float(subject.get("fee_per_unit", 0))
+            fee = units * fee_per_unit
     except Exception:
         subject = None
-    fee = 0
-    if subject:
-        units = float(subject.get("units", 0))
-        fee_per_unit = float(subject.get("fee_per_unit", 0))
-        fee = units * fee_per_unit
-    # Upsert student's semester bill
+
     bill = db["bill"].find_one({"student_id": enr.student_id, "semester": enr.semester})
     if not bill:
         bill_doc = BillSchema(student_id=enr.student_id, semester=enr.semester, lines=[], total=0, paid=0, status="unpaid")
         bill_id = create_document("bill", bill_doc)
-        bill = db["bill"].find_one({"_id": db["bill"].find_one({"_id": {"$exists": True}})["_id"]}) if False else db["bill"].find_one({"_id": db["bill"].find_one})
-        from bson import ObjectId as _OID
-        bill = db["bill"].find_one({"_id": _OID(bill_id)})
-    # Add line
+        bill = db["bill"].find_one({"_id": ObjectId(bill_id)})
+
+    # Add bill line and recompute totals
     line = {"subject_id": enr.subject_id, "description": "Tuition for subject", "amount": fee}
     db["bill"].update_one({"_id": bill["_id"]}, {"$push": {"lines": line}, "$set": {"updated_at": datetime.utcnow()}})
-    # Recompute totals
     bill = db["bill"].find_one({"_id": bill["_id"]})
     total = sum(float(l.get("amount", 0)) for l in bill.get("lines", []))
-    status = "paid" if bill.get("paid", 0) >= total and total > 0 else ("partial" if bill.get("paid", 0) > 0 else "unpaid")
+    status = "paid" if float(bill.get("paid", 0)) >= total and total > 0 else ("partial" if float(bill.get("paid", 0)) > 0 else "unpaid")
     db["bill"].update_one({"_id": bill["_id"]}, {"$set": {"total": total, "status": status}})
+
     return {"id": eid}
 
 
@@ -181,7 +211,6 @@ class PaymentCreate(BaseModel):
 
 @app.post("/payments")
 def create_payment(payload: PaymentCreate):
-    from bson import ObjectId
     bill = db["bill"].find_one({"_id": ObjectId(payload.bill_id)})
     if not bill:
         raise HTTPException(status_code=404, detail="Bill not found")
